@@ -50,7 +50,7 @@ pub fn derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let struct_fields = input.variants.iter().map(|variant| {
         let builder_name = variant.resolve_builder_name();
         let variant_ty = type_of(&variant);
-        quote!(#builder_name: Option<::druid::WidgetPod<#variant_ty, Box<dyn ::druid::Widget<#variant_ty>>>>)
+        quote!(#builder_name: Option<::druid::WidgetPod<(Shared, #variant_ty), Box<dyn ::druid::Widget<(Shared, #variant_ty)>>>>)
     });
 
     let struct_defaults = input.variants.iter().map(|variant| {
@@ -62,7 +62,7 @@ pub fn derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
         let builder_name = variant.resolve_builder_name();
         let variant_ty = type_of(&variant);
         quote! {
-            pub fn #builder_name(mut self, widget: impl ::druid::Widget<#variant_ty> + 'static) -> Self {
+            pub fn #builder_name(mut self, widget: impl ::druid::Widget<(Shared, #variant_ty)> + 'static) -> Self {
                 self.#builder_name = Some(::druid::WidgetPod::new(Box::new(widget)));
                 self
             }
@@ -84,7 +84,14 @@ pub fn derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
         let (data_pattern, data_values) = data_of(&variant, "");
         quote! {
             #enum_name::#variant_name #data_pattern => match &mut self.#builder_name {
-                Some(widget) => widget.event(ctx, event, #data_values, env),
+                Some(widget) => {
+                    let mut d = (data.0.to_owned(), #data_values.to_owned());
+                    widget.event(ctx, event, &mut d, env);
+                    *data = (
+                        d.0,
+                        #enum_name::#variant_name(d.1),
+                    );
+                },
                 None => (),
             }
         }
@@ -96,7 +103,7 @@ pub fn derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
         let (data_pattern, data_values) = data_of(&variant, "");
         quote! {
             #enum_name::#variant_name #data_pattern => match &mut self.#builder_name {
-                Some(widget) => widget.lifecycle(ctx, event, #data_values, env),
+                Some(widget) => widget.lifecycle(ctx, event, &(data.0.to_owned(), #data_values.to_owned()), env),
                 None => (),
             }
         }
@@ -110,7 +117,7 @@ pub fn derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
         quote! {
             (#enum_name::#variant_name #old_data_pattern, #enum_name::#variant_name #data_pattern) => {
                 match &mut self.#builder_name {
-                    Some(widget) => widget.update(ctx, #data_values, env),
+                    Some(widget) => widget.update(ctx, &(data.0.to_owned(), #data_values.to_owned()), env),
                     None => (),
                 }
             }
@@ -124,8 +131,8 @@ pub fn derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
         quote! {
             #enum_name::#variant_name #data_pattern => match &mut self.#builder_name {
                 Some(widget) => {
-                    let size = widget.layout(ctx, bc, #data_values, env);
-                    widget.set_layout_rect(ctx, #data_values, env, size.to_rect());
+                    let size = widget.layout(ctx, bc, &(data.0.to_owned(), #data_values.to_owned()), env);
+                    widget.set_layout_rect(ctx, &(data.0.to_owned(), #data_values.to_owned()), env, size.to_rect());
                     size
                 },
                 None => bc.min(),
@@ -139,7 +146,7 @@ pub fn derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
         let (data_pattern, data_values) = data_of(&variant, "");
         quote! {
             #enum_name::#variant_name #data_pattern => match &mut self.#builder_name {
-                Some(widget) => widget.paint(ctx, #data_values, env),
+                Some(widget) => widget.paint(ctx, &(data.0.to_owned(), #data_values.to_owned()), env),
                 None => (),
             }
         }
@@ -147,18 +154,18 @@ pub fn derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
 
     let output = quote! {
         impl #enum_name {
-            pub fn matcher() -> #matcher_name {
+            pub fn matcher<Shared: ::druid::Data>() -> #matcher_name<Shared> {
                 #matcher_name::new()
             }
         }
 
-        #visibility struct #matcher_name {
+        #visibility struct #matcher_name<Shared: ::druid::Data> {
             #(#struct_fields,)*
             default_: Option<Box<dyn ::druid::Widget<#enum_name>>>,
             discriminant_: Option<::std::mem::Discriminant<#enum_name>>,
         }
 
-        impl #matcher_name {
+        impl<Shared> #matcher_name<Shared> where Shared: ::druid::Data {
             pub fn new() -> Self {
                 Self {
                     #(#struct_defaults,)*
@@ -177,16 +184,16 @@ pub fn derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
             #(#builder_fns)*
         }
 
-        impl ::druid::Widget<#enum_name> for #matcher_name {
+        impl<Shared> ::druid::Widget<(Shared, #enum_name)> for #matcher_name<Shared> where Shared: ::druid::Data {
             fn event(
                 &mut self,
                 ctx: &mut ::druid::EventCtx,
                 event: &::druid::Event,
-                data: &mut #enum_name,
+                data: &mut (Shared, #enum_name),
                 env: &::druid::Env
             ) {
-                if self.discriminant_ == Some(::std::mem::discriminant(data)) {
-                    match data {
+                if self.discriminant_ == Some(::std::mem::discriminant(&data.1)) {
+                    match &mut data.1 {
                         #(#event_match)*
                     }
                 }
@@ -195,24 +202,24 @@ pub fn derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
                 &mut self,
                 ctx: &mut ::druid::LifeCycleCtx,
                 event: &::druid::LifeCycle,
-                data: &#enum_name,
+                data: &(Shared, #enum_name),
                 env: &::druid::Env
             ) {
-                self.discriminant_ = Some(::std::mem::discriminant(data));
+                self.discriminant_ = Some(::std::mem::discriminant(&data.1));
                 if let ::druid::LifeCycle::WidgetAdded = event {
                     #(#widget_added_checks)*
                 }
-                match data {
+                match &data.1 {
                     #(#lifecycle_match)*
                 }
             }
             fn update(&mut self,
                 ctx: &mut ::druid::UpdateCtx,
-                old_data: &#enum_name,
-                data: &#enum_name,
+                old_data: &(Shared, #enum_name),
+                data: &(Shared, #enum_name),
                 env: &::druid::Env
             ) {
-                match (old_data, data) {
+                match (&old_data.1, &data.1) {
                     #(#update_match)*
                     _ => {
                         ctx.children_changed();
@@ -223,15 +230,15 @@ pub fn derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
                 &mut self,
                 ctx: &mut ::druid::LayoutCtx,
                 bc: &::druid::BoxConstraints,
-                data: &#enum_name,
+                data: &(Shared, #enum_name),
                 env: &::druid::Env
             ) -> ::druid::Size {
-                match data {
+                match &data.1 {
                     #(#layout_match)*
                 }
             }
-            fn paint(&mut self, ctx: &mut ::druid::PaintCtx, data: &#enum_name, env: &::druid::Env) {
-                match data {
+            fn paint(&mut self, ctx: &mut ::druid::PaintCtx, data: &(Shared, #enum_name), env: &::druid::Env) {
+                match &data.1 {
                     #(#paint_match)*
                 }
             }
